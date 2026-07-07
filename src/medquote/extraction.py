@@ -12,11 +12,15 @@ first — the schema semantics live there, not here.
 """
 
 import os
-from openai import OpenAI
+import time
+from openai import OpenAI, RateLimitError, APIError
 from dotenv import load_dotenv
 from medquote.models import QuoteDocument
+import tiktoken
 
 load_dotenv()
+
+_DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-2024-08-06")
 
 _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -163,12 +167,30 @@ _SYSTEM_PROMPT = (
 )
 
 
-def extract_quote(text: str, model: str = "gpt-4o-2024-08-06") -> QuoteDocument:
+_TOKEN_LIMIT = 100_000
+
+def _check_token_limit(text: str, model: str) -> int:
+    """Return token count and warn if near the limit."""
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        enc = tiktoken.get_encoding("cl100k_base")
+    token_count = len(enc.encode(text))
+    if token_count > _TOKEN_LIMIT:
+        raise ValueError(
+            f"Input text is {token_count:,} tokens, which exceeds the safe limit "
+            f"of {_TOKEN_LIMIT:,}. Consider splitting the document."
+        )
+    return token_count
+
+
+def extract_quote(text: str, model: str = _DEFAULT_MODEL, retries: int = 3) -> QuoteDocument:
     """Extract full quote data using structured output.
 
     Args:
         text: Raw text extracted from the PDF (via pdfplumber or OCR).
         model: OpenAI model supporting response_format structured output.
+        retries: Number of retry attempts on transient API errors.
 
     Returns:
         QuoteDocument with parsed fields per data_model.md rules.
@@ -186,12 +208,29 @@ def extract_quote(text: str, model: str = "gpt-4o-2024-08-06") -> QuoteDocument:
     - Detect standalone discount line items for dual-sheet export
     - Extract trade-in allowance separately when explicitly stated
     """
-    response = _client.chat.completions.parse(
-        model=model,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        response_format=QuoteDocument,
-    )
-    return response.choices[0].message.parsed
+    token_count = _check_token_limit(text, model)
+    print(f"  Token estimate: {token_count:,}")
+    for attempt in range(retries):
+        try:
+            response = _client.chat.completions.parse(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+],
+                response_format=QuoteDocument,
+            )
+            return response.choices[0].message.parsed
+        except RateLimitError:
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  Rate limited. Retrying in {wait}s... (attempt {attempt + 1}/{retries})")
+                time.sleep(wait)
+            else:
+                raise
+        except APIError as exc:
+            if attempt < retries - 1:
+                print(f"  API error: {exc}. Retrying... (attempt {attempt + 1}/{retries})")
+                time.sleep(2)
+            else:
+                raise

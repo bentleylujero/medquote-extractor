@@ -272,8 +272,12 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
         # An item is the discount line if it has a negative ext_net_price
         # or its description indicates discount
         is_negative = item.ext_net_price is not None and item.ext_net_price < 0
-        is_discount_desc = item.description and "discount" in item.description.lower()
-        if is_negative and is_discount_desc:
+        is_discount_desc = item.description and any(
+            kw in item.description.lower()
+            for kw in ("discount", "allowance", "less:", "credit", "rebate")
+        )
+        is_null_component = item.component is None
+        if is_negative and (is_discount_desc or is_null_component):
             discount_items.append(item)
         elif item.ext_list_price is not None and item.ext_net_price is not None:
             priced_items.append(item)
@@ -414,7 +418,14 @@ def export_to_excel(docs: list[QuoteDocument], output_path: str):
                 sheet_b = _build_proportional_allocation_sheet(wb, doc)
                 sheets_created.extend([sheet_a, sheet_b])
             else:
-                ws = wb.create_sheet(title=f"{doc.source_id[:20]}")
+                base_title = doc.source_id[:20]
+                title = base_title
+                counter = 1
+                existing_titles = [s.title for s in wb.worksheets]
+                while title in existing_titles:
+                    title = f"{base_title[:17]}_{counter}"
+                    counter += 1
+                ws = wb.create_sheet(title=title)
                 max_col = len(HEADERS)
                 _build_line_item_rows(ws, doc, 1, max_col)
                 _auto_width(ws, max_col, ws.max_row)

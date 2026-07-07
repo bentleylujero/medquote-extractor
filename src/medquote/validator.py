@@ -57,6 +57,9 @@ def _compute_discount(item: QuoteLineItem) -> str | None:
 def _flag_price_anomalies(item: QuoteLineItem) -> str | None:
     """Check for obvious price issues and return a flag string."""
     issues = []
+    # Flag when prices exist but quantity is missing
+    if item.quantity is None and (item.net_price is not None or item.list_price is not None):
+        issues.append("Quantity missing despite price being present — extended price may be unreliable")
     if item.list_price and item.net_price and item.net_price > item.list_price:
         issues.append("Net price exceeds list price")
     if item.ext_list_price and item.list_price and item.quantity:
@@ -93,15 +96,28 @@ def _verify_total_against_document(doc: QuoteDocument, raw_text: str) -> tuple[f
     # Check if the document text has a subtotal/subtotal/grand-total figure
     # Look for patterns like 'Subtotal 699,538.14' or 'Total 699,538.14'
     patterns = [
-        r'(?:Subtotal|Sub-total|SUBTOTAL)[:\s]*\$?([\d,]+\.?\d*)',
-        r'(?:List Total|LIST TOTAL|List Total|Grand Total|Total|Net Total|Amount Due)[:\s]*\$?([\d,]+\.?\d*)',
+        # Most specific first — unambiguous grand total labels
+        r'(?:Grand Total|Net Total|Amount Due|Total Due)[:\s]*\$?([\d,]+\.?\d*)',
+        # Subtotal — explicit label
+        r'(?:^|\n)\s*(?:Subtotal|Sub-total)[:\s]*\$?([\d,]+\.?\d*)',
+        # List Total — common in medical equipment quotes
+        r'(?:List Total)[:\s]*\$?([\d,]+\.?\d*)',
+        # Generic "Total" — only match at start of line to avoid "Item Total", "Installation Total", etc.
+        r'(?:^|\n)\s*Total[:\s]*\$?([\d,]+\.?\d*)',
     ]
     doc_total = None
     for pattern in patterns:
-        matches = re.findall(pattern, raw_text, re.IGNORECASE)
+        matches = re.findall(pattern, raw_text, re.IGNORECASE | re.MULTILINE)
         if matches:
-            val = float(matches[-1].replace(',', ''))
-            doc_total = val
+            # Take the LAST match for this pattern (most likely the final summary)
+            val_str = matches[-1].replace(',', '')
+            try:
+                val = float(val_str)
+                if val > 0:
+                    doc_total = val
+                    break  # Stop at the first pattern that yields a positive match
+            except ValueError:
+                continue
 
     if doc_total is None:
         return None, None  # No subtotal found, can't verify
@@ -130,10 +146,10 @@ def validate_quote(doc: QuoteDocument, raw_text: str | None = None) -> QuoteDocu
     doc.title = f"{doc.source_id} #{doc.quote_number} - {doc.quote_date}"
 
     # Step 2: Normalize each line item
-    for item in doc.line_items:
-        item = _calculate_extended_prices(item)
-        item.discount = _compute_discount(item)
-        item.additional_info = _flag_price_anomalies(item)
+    for i, item in enumerate(doc.line_items):
+        doc.line_items[i] = _calculate_extended_prices(item)
+        doc.line_items[i].discount = _compute_discount(doc.line_items[i])
+        doc.line_items[i].additional_info = _flag_price_anomalies(doc.line_items[i])
 
     # Step 3: Verify total against document subtotal
     if raw_text:

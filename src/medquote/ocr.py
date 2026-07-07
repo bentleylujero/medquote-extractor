@@ -6,9 +6,9 @@ from google.cloud import documentai
 _client = None
 _processor_name = None
 
-_PROJECT_ID = "document-extract-501717"
-_LOCATION = "us"  # us-central1 multi-region
-_PROCESSOR_ID = "ef0450581192a2dc"
+_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "document-extract-501717")
+_LOCATION = os.getenv("GCP_LOCATION", "us")
+_PROCESSOR_ID = os.getenv("GCP_PROCESSOR_ID", "ef0450581192a2dc")
 
 
 def _get_client():
