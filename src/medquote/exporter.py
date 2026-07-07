@@ -30,15 +30,37 @@ HEADERS = [
     "Additional Information",
 ]
 
-# Style constants
+# ---------------------------------------------------------------------------
+# Color tier definitions
+# ---------------------------------------------------------------------------
+# Each column is tagged with its data tier:
+#   "green"  = taken verbatim from the quote document (rendered as white bg)
+#   "yellow" = interpreted/derived from context in the quote
+#   "red"    = N/A — any blank/null cell gets red fill
+#
+# The tier name determines the label shown on the section header row, and
+# controls blank-cell fill colour.
+# ---------------------------------------------------------------------------
+COLUMN_TIERS = {
+    1: "green",   # Catalog #
+    2: "green",   # Description
+    3: "yellow",  # Component (AI-classified)
+    4: "green",   # QTY
+    5: "green",   # List Price
+    6: "green",   # Net Price
+    7: "yellow",  # Ext. List Price (computed)
+    8: "yellow",  # Ext. Net Price (computed)
+    9: "yellow",  # Discount (derived)
+   10: "yellow",  # Additional Information (AI flags)
+}
+
+# Style constants — no more yellow/orange fills on data rows
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-TITLE_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
 TITLE_FONT = Font(bold=True, size=12, color="1F4E79")
-FLAG_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # light yellow
-SUBTOTAL_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")  # light green
+SUBTOTAL_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
 SUBTOTAL_FONT = Font(bold=True, size=11)
-NOTE_FILL = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")  # light orange
+
 THIN_BORDER = Border(
     left=Side(style="thin"),
     right=Side(style="thin"),
@@ -46,14 +68,61 @@ THIN_BORDER = Border(
     bottom=Side(style="thin"),
 )
 
+# Colour fills for data-tier indicators
+GREEN_ACCENT = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+YELLOW_ACCENT = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+RED_ACCENT = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+# Fill for blank/N/A cells
+RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+
+def _write_section_header(ws, row: int, doc: QuoteDocument, max_col: int) -> int:
+    """Write a coloured data-tier label above the quote title.
+
+    A single row with three coloured bands indicating which columns are
+    green-tier (verbatim), yellow-tier (derived), and red-tier (N/A).
+    """
+    # Tier label: coloured bars above the quote
+    tier_labels = {"green": "  Sourced  ", "yellow": " Derived ", "red": "   N/A   "}
+    tier_colors = {"green": GREEN_ACCENT, "yellow": YELLOW_ACCENT, "red": RED_ACCENT}
+
+    # Group contiguous columns by tier for merged label spans
+    current_tier = None
+    start_col = 1
+    for col_idx in range(1, max_col + 1):
+        col_tier = COLUMN_TIERS.get(col_idx, "red")
+        if col_tier != current_tier:
+            if current_tier is not None and start_col <= col_idx - 1:
+                # Write the tier label
+                label_cell = ws.cell(row=row, column=start_col, value=tier_labels[current_tier])
+                label_cell.fill = tier_colors[current_tier]
+                label_cell.font = Font(bold=True, size=9, color="555555")
+                label_cell.alignment = Alignment(horizontal="center", vertical="center")
+                label_cell.border = THIN_BORDER
+                if col_idx - 1 > start_col:
+                    ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=col_idx - 1)
+            start_col = col_idx
+            current_tier = col_tier
+    # Write the last group
+    if current_tier is not None:
+        label_cell = ws.cell(row=row, column=start_col, value=tier_labels[current_tier])
+        label_cell.fill = tier_colors[current_tier]
+        label_cell.font = Font(bold=True, size=9, color="555555")
+        label_cell.alignment = Alignment(horizontal="center", vertical="center")
+        label_cell.border = THIN_BORDER
+        if max_col > start_col:
+            ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=max_col)
+
+    return row + 1
+
 
 def _write_title_row(ws, row: int, doc: QuoteDocument, max_col: int) -> int:
-    """Write the quote title across the top with a shaded background."""
+    """Write the quote title across the top — no coloured fill, just bold text."""
     title_text = f"{doc.title}"
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max_col)
     cell = ws.cell(row=row, column=1, value=title_text)
     cell.font = TITLE_FONT
-    cell.fill = TITLE_FILL
     cell.alignment = Alignment(horizontal="left", vertical="center")
     return row + 1
 
@@ -69,6 +138,11 @@ def _write_header_row(ws, row: int) -> int:
     return row + 1
 
 
+def _get_column_tier(col_idx: int) -> str:
+    """Return the data tier for a column index: 'green', 'yellow', or 'red'."""
+    return COLUMN_TIERS.get(col_idx, "red")
+
+
 def _write_line_item(
     ws,
     row: int,
@@ -76,17 +150,11 @@ def _write_line_item(
     *,
     highlight_discount: bool = False,
 ) -> int:
-    """Write a single line item row.
+    """Write a single line item row with colour-coded cells.
 
-    Price values are stored as actual numbers (not formatted strings)
-    so Excel can sum/filter them. The NumberFormat handles display.
-
-    Args:
-        ws: Worksheet to write to.
-        row: Row number to write at.
-        item: The line item data.
-        highlight_discount: If True, highlight rows with negative prices
-            (discount line items) with a distinct fill.
+    Green-tier cells (sourced verbatim): white background.
+    Yellow-tier cells (derived/interpreted): yellow fill.
+    Any blank/null cell: red fill (N/A).
     """
     list_price = item.list_price if item.list_price is not None else None
     net_price = item.net_price if item.net_price is not None else None
@@ -96,24 +164,33 @@ def _write_line_item(
     values = [
         item.catalog_number,                     # 1 - Catalog #
         item.description,                        # 2 - Description
-        item.component.value if item.component else "",  # 3 - Component
+        item.component.value if item.component else None,  # 3 - Component (None for N/A)
         item.quantity,                           # 4 - QTY (number)
         list_price,                              # 5 - List Price (number or None)
         net_price,                               # 6 - Net Price (number or None)
         ext_list,                                # 7 - Ext. List Price (number or None)
         ext_net,                                 # 8 - Ext. Net Price (number or None)
-        item.discount or "",                     # 9 - Discount (string)
-        item.additional_info or "",              # 10 - Additional Information
+        item.discount,                           # 9 - Discount (string or None)
+        item.additional_info,                    # 10 - Additional Information (string or None)
     ]
-
-    has_flags = bool(item.additional_info)
-    has_discount_line = highlight_discount and (
-        any(v is not None and isinstance(v, (int, float)) and v < 0 for v in [list_price, net_price, ext_list, ext_net])
-    )
 
     for col_idx, val in enumerate(values, start=1):
         cell = ws.cell(row=row, column=col_idx, value=val)
         cell.border = THIN_BORDER
+        tier = _get_column_tier(col_idx)
+
+        # Apply colour based on tier and whether the cell is empty
+        if val is None or (isinstance(val, str) and not val.strip()):
+            # N/A → red fill
+            cell.fill = RED_FILL
+            # Keep the cell empty — don't write "N/A" text
+            cell.value = None
+        elif tier == "yellow":
+            # Derived/interpreted value → yellow fill (with text in black)
+            cell.fill = YELLOW_ACCENT
+        else:
+            # Green-tier (sourced verbatim) → white background (no fill)
+            pass
 
         # Price columns: right-align, dollar format, actual numbers
         if col_idx in (5, 6, 7, 8):
@@ -126,12 +203,6 @@ def _write_line_item(
             cell.alignment = Alignment(wrap_text=True, vertical="top")
         else:
             cell.alignment = Alignment(vertical="top")
-
-        # Highlight rows
-        if has_discount_line:
-            cell.fill = NOTE_FILL  # orange for discount rows
-        elif has_flags:
-            cell.fill = FLAG_FILL  # yellow for flags
 
     return row + 1
 
@@ -205,6 +276,8 @@ def _build_line_item_rows(ws, doc: QuoteDocument, current_row: int, max_col: int
 
     Returns the total ext_net_price for use in summary rows.
     """
+    # Data-tier section header row (coloured bands)
+    current_row = _write_section_header(ws, current_row, doc, max_col)
     # Title row
     current_row = _write_title_row(ws, current_row, doc, max_col)
     # Header row
@@ -288,10 +361,12 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
     ws = wb.create_sheet(title="Discount Applied Proportionally")
     max_col = len(HEADERS)
 
+    # Data-tier section header
+    current_row = _write_section_header(ws, 1, doc, max_col)
     # Title row
-    current_row = _write_title_row(ws, 1, doc, max_col)
+    current_row = _write_title_row(ws, current_row, doc, max_col)
 
-    # Annotation row explaining the calculation
+    # Annotation row explaining the calculation — no fill, just italic text
     note = (
         f"Discount of ${total_discount:,.2f} allocated proportionally "
         f"at {x:.4%} across {len(priced_items)} priced line item(s)."
@@ -302,7 +377,6 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
     )
     note_cell = ws.cell(row=current_row, column=1, value=note)
     note_cell.font = Font(italic=True, size=10, color="666666")
-    note_cell.fill = NOTE_FILL
     note_cell.alignment = Alignment(horizontal="left", vertical="center")
     current_row += 1
 
@@ -312,11 +386,11 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
     # List unpriced items first (shown for reference, no discount applied)
     for item in unpriced_items:
         current_row = _write_line_item(ws, current_row, item)
-        # Override ext_net_price cell to show N/A
+        # Override ext_net_price cell to show N/A (red)
         ext_net_cell = ws.cell(row=current_row - 1, column=8)
         ext_net_cell.value = None
+        ext_net_cell.fill = RED_FILL
         ext_net_cell.number_format = '@'
-        ext_net_cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
     # Write priced items with proportionally adjusted ext_net_price
     total_adjusted_net = 0.0
@@ -324,41 +398,14 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
         adjusted_ext_net = round(item.ext_list_price * (1 - x), 2) if item.ext_list_price is not None else None
         total_adjusted_net += adjusted_ext_net if adjusted_ext_net is not None else 0.0
 
-        # Create a copy-like row with adjusted ext_net_price
-        values = [
-            item.catalog_number,
-            item.description,
-            item.component.value if item.component else "",
-            item.quantity,
-            item.list_price,
-            item.net_price,
-            item.ext_list_price,
-            adjusted_ext_net,
-            item.discount or "",
-            item.additional_info or "",
-        ]
-
-        has_flags = bool(item.additional_info)
-
-        for col_idx, val in enumerate(values, start=1):
-            cell = ws.cell(row=current_row, column=col_idx, value=val)
-            cell.border = THIN_BORDER
-
-            if col_idx in (5, 6, 7, 8):
-                cell.alignment = Alignment(horizontal="right", vertical="top")
-                if val is not None:
-                    cell.number_format = '$#,##0.00'
-            elif col_idx == 9 and val:
-                cell.alignment = Alignment(horizontal="right", vertical="top")
-            elif col_idx == 10:
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-            else:
-                cell.alignment = Alignment(vertical="top")
-
-            if has_flags:
-                cell.fill = FLAG_FILL
-
-        current_row += 1
+        # Use normal _write_line_item, then override ext_net_price
+        current_row = _write_line_item(ws, current_row, item)
+        data_row = current_row - 1
+        ext_net_cell = ws.cell(row=data_row, column=8)
+        ext_net_cell.value = adjusted_ext_net
+        if adjusted_ext_net is not None:
+            ext_net_cell.number_format = '$#,##0.00'
+            ext_net_cell.fill = YELLOW_ACCENT  # derived value
 
     # Summary row
     current_row = _write_summary_row(
@@ -375,7 +422,7 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
 
 
 def _build_single_sheet(wb, docs: list[QuoteDocument]) -> str:
-    """Single-sheet export: all quotes in sequential blocks, unchanged behavior."""
+    """Single-sheet export: all quotes in sequential blocks."""
     ws = wb.active
     ws.title = "Quote Line Items"
 
@@ -408,10 +455,6 @@ def export_to_excel(docs: list[QuoteDocument], output_path: str):
 
     Quotes without discount line items remain single-sheet and are handled
     identically to the previous behavior.
-
-    Args:
-        docs: List of QuoteDocument objects from extraction + validation.
-        output_path: Path for the .xlsx output file.
     """
     wb = openpyxl.Workbook()
 
@@ -419,24 +462,19 @@ def export_to_excel(docs: list[QuoteDocument], output_path: str):
     has_any_discount = any(doc.has_discount_line_item for doc in docs)
 
     if not has_any_discount:
-        # Standard single-sheet export — unchanged from previous behavior
         _build_single_sheet(wb, docs)
     else:
-        # Remove the default empty sheet — we'll create named ones
         default_ws = wb.active
-        assert default_ws is not None  # Workbook always has an active sheet
+        assert default_ws is not None
 
-        # Track which sheets we create
         sheets_created = []
 
         for doc in docs:
             if doc.has_discount_line_item:
-                # Create dual sheets for this quote
                 sheet_a = _build_discount_as_line_item_sheet(wb, doc)
                 sheet_b = _build_proportional_allocation_sheet(wb, doc)
                 sheets_created.extend([sheet_a, sheet_b])
             else:
-                # Standard single-sheet block for this quote
                 ws = wb.create_sheet(title=f"{doc.source_id[:20]}")
                 max_col = len(HEADERS)
                 _build_line_item_rows(ws, doc, 1, max_col)
@@ -444,7 +482,6 @@ def export_to_excel(docs: list[QuoteDocument], output_path: str):
                 ws.freeze_panes = "A2"
                 sheets_created.append(ws.title)
 
-        # Remove the default empty sheet if we created named ones
         if sheets_created:
             wb.remove(default_ws)
 
