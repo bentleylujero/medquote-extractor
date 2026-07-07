@@ -5,3 +5,13 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+
+# Credentials — never commit service account keys
+*.json
+!sample_quotes/.gitkeep
+
+# Generated outputs — never commit
+*.xlsx
+
+# Real vendor quotes — never commit (pricing/procurement data)
+sample_quotes/*.pdf
