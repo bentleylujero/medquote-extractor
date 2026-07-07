@@ -8,6 +8,7 @@ It performs deterministic fixes that don't need another LLM call:
 - Flagging obvious issues
 """
 
+import re
 from medquote.models import QuoteDocument, QuoteLineItem
 
 # Canonical vendor name mappings: any key found in source_id
@@ -82,7 +83,47 @@ def _calculate_extended_prices(item: QuoteLineItem) -> QuoteLineItem:
     return item
 
 
-def validate_quote(doc: QuoteDocument) -> QuoteDocument:
+def _verify_total_against_document(doc: QuoteDocument, raw_text: str) -> tuple[float | None, str | None]:
+    """Check the extracted total sum against the document's stated subtotal.
+
+    Returns (doc_total, warning_string) where doc_total is the subtotal found
+    in the document text (or None if not found), and warning_string is a
+    mismatch warning or None if OK.
+    """
+    # Check if the document text has a subtotal/subtotal/grand-total figure
+    # Look for patterns like 'Subtotal 699,538.14' or 'Total 699,538.14'
+    patterns = [
+        r'(?:Subtotal|Sub-total|SUBTOTAL)[:\s]*\$?([\d,]+\.?\d*)',
+        r'(?:List Total|LIST TOTAL|List Total|Grand Total|Total|Net Total|Amount Due)[:\s]*\$?([\d,]+\.?\d*)',
+    ]
+    doc_total = None
+    for pattern in patterns:
+        matches = re.findall(pattern, raw_text, re.IGNORECASE)
+        if matches:
+            val = float(matches[-1].replace(',', ''))
+            doc_total = val
+
+    if doc_total is None:
+        return None, None  # No subtotal found, can't verify
+
+    # Sum the extracted net prices
+    extracted_sum = sum(
+        item.ext_net_price for item in doc.line_items
+        if item.ext_net_price is not None
+    )
+
+    warning = None
+    if abs(extracted_sum - doc_total) > 1.0:
+        warning = (
+            f"Total mismatch: sum of extracted items=${extracted_sum:,.2f} "
+            f"vs document subtotal=${doc_total:,.2f} "
+            f"(difference=${abs(extracted_sum - doc_total):,.2f})"
+        )
+
+    return doc_total, warning
+
+
+def validate_quote(doc: QuoteDocument, raw_text: str | None = None) -> QuoteDocument:
     """Run all validation/normalization on a single QuoteDocument."""
     # Step 1: Canonicalize vendor name
     doc.source_id = _canonicalize_vendor(doc.source_id)
@@ -93,5 +134,21 @@ def validate_quote(doc: QuoteDocument) -> QuoteDocument:
         item = _calculate_extended_prices(item)
         item.discount = _compute_discount(item)
         item.additional_info = _flag_price_anomalies(item)
+
+    # Step 3: Verify total against document subtotal
+    if raw_text:
+        doc_total, total_warn = _verify_total_against_document(doc, raw_text)
+        # Store the document subtotal if found (prefer the model's extraction,
+        # but fall back to our regex if the model didn't capture it)
+        if doc_total is not None and doc.document_subtotal is None:
+            doc.document_subtotal = doc_total
+        if total_warn:
+            # Append warning to the last line item's additional_info
+            if doc.line_items:
+                last = doc.line_items[-1]
+                existing = last.additional_info or ""
+                last.additional_info = (
+                    f"{existing} ⚠ {total_warn}" if existing else f"⚠ {total_warn}"
+                )
 
     return doc

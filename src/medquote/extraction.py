@@ -146,6 +146,20 @@ _SYSTEM_PROMPT = (
     "14. For nested/grouped items (e.g. a system with sub-components), create "
     "separate line items for each sub-component AND note the grouping in "
     "additional_info.\n"
+    "15. DOCUMENT TOTAL VERIFICATION: Many quotes include a subtotal, "
+    "list-total, or grand-total figure near the bottom (e.g. 'Subtotal 699,538.14', "
+    "'List Total 726,907.85', 'Total 757,142.79'). "
+    "FIRST: Extract this figure into the 'document_subtotal' field on "
+    "QuoteDocument (the field exists specifically for this purpose). "
+    "SECOND: After extracting ALL line items, sum their ext_net_price values "
+    "(including negative discount items). If your sum does NOT match the "
+    "document's stated subtotal (within $1.00), you have likely MISSED one or "
+    "more line items. Go back and check the document again for items you "
+    "missed — especially Freight, Shipping, Accessories, Training, "
+    "Installation, or small-dollar items near the end of the quote. "
+    "The document's stated subtotal is the correct total. If you cannot "
+    "find the missing item(s), flag the discrepancy in the last line "
+    "item's additional_info field as 'Total mismatch: sum=XXX vs document=YYY'.\n"
 )
 
 

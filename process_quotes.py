@@ -91,7 +91,7 @@ def main():
             print(f"    Raw line items: {len(doc.line_items)}")
 
             # Step 2b: Validation / normalization
-            doc = validate_quote(doc)
+            doc = validate_quote(doc, raw_text=text)
             print(f"  ✓ Validated: vendor normalized, prices computed, flags checked")
             print(f"    Final line items: {len(doc.line_items)}")
             for item in doc.line_items:

@@ -70,7 +70,7 @@ THIN_BORDER = Border(
 
 # Colour fills for data-tier indicators
 GREEN_ACCENT = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-YELLOW_ACCENT = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+YELLOW_ACCENT = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 RED_ACCENT = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
 # Fill for blank/N/A cells
@@ -308,7 +308,12 @@ def _build_discount_as_line_item_sheet(wb, doc: QuoteDocument) -> str:
     current_row, total_net = _build_line_item_rows(ws, doc, 1, max_col)
 
     # Summary row
-    current_row = _write_summary_row(ws, current_row + 1, "Total (incl. discount)", total_net, max_col)
+    effective_total = doc.document_subtotal if doc.document_subtotal is not None else total_net
+    label = "Total (incl. discount)"
+    d = doc.document_subtotal
+    if d is not None and abs(d - (total_net if total_net is not None else 0.0)) > 1.0:
+        label = f"Total (document subtotal=${d:,.2f})"
+    current_row = _write_summary_row(ws, current_row + 1, label, effective_total, max_col)
 
     # Auto-width and freeze
     _auto_width(ws, max_col, current_row - 1)
@@ -408,10 +413,15 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
             ext_net_cell.fill = YELLOW_ACCENT  # derived value
 
     # Summary row
+    label = f"Total (after {x:.4%} proportional discount)"
+    effective_total = doc.document_subtotal if doc.document_subtotal is not None else round(total_adjusted_net, 2)
+    d = doc.document_subtotal
+    if d is not None and abs(d - round(total_adjusted_net, 2)) > 1.0:
+        label = f"Total (document subtotal=${d:,.2f})"
     current_row = _write_summary_row(
         ws, current_row + 1,
-        f"Total (after {x:.4%} proportional discount)",
-        round(total_adjusted_net, 2),
+        label,
+        effective_total,
         max_col,
     )
 

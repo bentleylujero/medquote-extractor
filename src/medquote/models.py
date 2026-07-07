@@ -164,3 +164,14 @@ class QuoteDocument(BaseModel):
         "discounts embedded per-line). False when per-line net prices "
         "already reflect any discounts. Triggers the dual-sheet export.",
     )
+    document_subtotal: Optional[float] = Field(
+        default=None,
+        description="The subtotal/grand-total explicitly stated on the quote "
+        "document. Extract this from summary rows near the bottom of the quote "
+        "(Subtotal, List Total, Total Due, Grand Total, Net Total, Amount Due). "
+        "This is the SUM of all line item prices as stated by the vendor. "
+        "It serves as the authoritative total for the quote and allows "
+        "downstream validation to detect if any line items were accidentally "
+        "skipped during extraction. Leave null if no clear subtotal/total figure "
+        "is present in the document.",
+    )
