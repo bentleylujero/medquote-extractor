@@ -1,6 +1,21 @@
+"""
+Excel export module for medical equipment quote extraction.
+
+Generates a single sheet for standard quotes, or two sheets when a quote
+contains an explicit standalone discount line item:
+
+  Sheet A ("Discount as Line Item"): Raw line items including the discount.
+  Sheet B ("Discount Applied Proportionally"): Discount proportionally
+    allocated across priced line items (excluding unpriced Base items).
+
+The dual-sheet logic is documented in data_model.md.
+"""
+
 import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, numbers
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 from medquote.models import QuoteDocument, QuoteLineItem
+from typing import Optional
 
 HEADERS = [
     "Catalog #",
@@ -21,6 +36,9 @@ HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
 TITLE_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
 TITLE_FONT = Font(bold=True, size=12, color="1F4E79")
 FLAG_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")  # light yellow
+SUBTOTAL_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")  # light green
+SUBTOTAL_FONT = Font(bold=True, size=11)
+NOTE_FILL = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")  # light orange
 THIN_BORDER = Border(
     left=Side(style="thin"),
     right=Side(style="thin"),
@@ -51,32 +69,47 @@ def _write_header_row(ws, row: int) -> int:
     return row + 1
 
 
-def _write_line_item(ws, row: int, item: QuoteLineItem):
+def _write_line_item(
+    ws,
+    row: int,
+    item: QuoteLineItem,
+    *,
+    highlight_discount: bool = False,
+) -> int:
     """Write a single line item row.
 
     Price values are stored as actual numbers (not formatted strings)
     so Excel can sum/filter them. The NumberFormat handles display.
+
+    Args:
+        ws: Worksheet to write to.
+        row: Row number to write at.
+        item: The line item data.
+        highlight_discount: If True, highlight rows with negative prices
+            (discount line items) with a distinct fill.
     """
-    # Price columns: store as actual numbers with $ format
     list_price = item.list_price if item.list_price is not None else None
     net_price = item.net_price if item.net_price is not None else None
     ext_list = item.ext_list_price if item.ext_list_price is not None else None
     ext_net = item.ext_net_price if item.ext_net_price is not None else None
 
     values = [
-        item.catalog_number,          # 1 - Catalog #
-        item.description,             # 2 - Description
-        item.component or "",         # 3 - Component
-        item.quantity,                # 4 - QTY (number)
-        list_price,                   # 5 - List Price (number or None)
-        net_price,                    # 6 - Net Price (number or None)
-        ext_list,                     # 7 - Ext. List Price (number or None)
-        ext_net,                      # 8 - Ext. Net Price (number or None)
-        item.discount or "",          # 9 - Discount (string like "12.5%")
-        item.additional_info or "",   # 10 - Additional Information
+        item.catalog_number,                     # 1 - Catalog #
+        item.description,                        # 2 - Description
+        item.component.value if item.component else "",  # 3 - Component
+        item.quantity,                           # 4 - QTY (number)
+        list_price,                              # 5 - List Price (number or None)
+        net_price,                               # 6 - Net Price (number or None)
+        ext_list,                                # 7 - Ext. List Price (number or None)
+        ext_net,                                 # 8 - Ext. Net Price (number or None)
+        item.discount or "",                     # 9 - Discount (string)
+        item.additional_info or "",              # 10 - Additional Information
     ]
 
     has_flags = bool(item.additional_info)
+    has_discount_line = highlight_discount and (
+        any(v is not None and isinstance(v, (int, float)) and v < 0 for v in [list_price, net_price, ext_list, ext_net])
+    )
 
     for col_idx, val in enumerate(values, start=1):
         cell = ws.cell(row=row, column=col_idx, value=val)
@@ -88,27 +121,49 @@ def _write_line_item(ws, row: int, item: QuoteLineItem):
             if val is not None:
                 cell.number_format = '$#,##0.00'
         elif col_idx == 9 and val:
-            # Discount is a text string like "12.5%"
             cell.alignment = Alignment(horizontal="right", vertical="top")
         elif col_idx == 10:
-            # Additional Info: wrap text for readability
             cell.alignment = Alignment(wrap_text=True, vertical="top")
         else:
             cell.alignment = Alignment(vertical="top")
 
-        # Highlight rows with flags in yellow
-        if has_flags:
-            cell.fill = FLAG_FILL
+        # Highlight rows
+        if has_discount_line:
+            cell.fill = NOTE_FILL  # orange for discount rows
+        elif has_flags:
+            cell.fill = FLAG_FILL  # yellow for flags
+
+    return row + 1
+
+
+def _write_summary_row(ws, row: int, label: str, value: Optional[float], max_col: int) -> int:
+    """Write a summary row (e.g. subtotal, total) across columns."""
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max_col - 1)
+    label_cell = ws.cell(row=row, column=1, value=label)
+    label_cell.font = SUBTOTAL_FONT
+    label_cell.fill = SUBTOTAL_FILL
+    label_cell.alignment = Alignment(horizontal="right", vertical="center")
+    label_cell.border = THIN_BORDER
+
+    value_cell = ws.cell(row=row, column=max_col, value=value)
+    value_cell.font = SUBTOTAL_FONT
+    value_cell.fill = SUBTOTAL_FILL
+    value_cell.alignment = Alignment(horizontal="right", vertical="center")
+    if value is not None:
+        value_cell.number_format = '$#,##0.00'
+    value_cell.border = THIN_BORDER
+
+    # Fill merged cells with borders
+    for c in range(2, max_col):
+        cell = ws.cell(row=row, column=c)
+        cell.fill = SUBTOTAL_FILL
+        cell.border = THIN_BORDER
 
     return row + 1
 
 
 def _auto_width(ws, max_col: int, max_row: int):
-    """Automatically adjust column widths based on content.
-
-    Sets sensible minimums and maximums per column type.
-    """
-    # Prescribed minimum widths per column (by 1-index)
+    """Automatically adjust column widths based on content."""
     min_widths = {
         1: 14,   # Catalog #
         2: 30,   # Description
@@ -130,36 +185,197 @@ def _auto_width(ws, max_col: int, max_row: int):
 
     for col_idx in range(1, max_col + 1):
         max_len = 0
-        col_letter = openpyxl.utils.get_column_letter(col_idx)
+        col_letter = get_column_letter(col_idx)
         for row in range(1, max_row + 1):
             cell = ws.cell(row=row, column=col_idx)
             if cell.value is not None:
-                # Rough width: characters, up to 2x for price strings
                 cell_len = len(str(cell.value))
                 if cell_len > max_len:
                     max_len = cell_len
 
-        # Apply minimum
         adjusted = max(max_len + 3, min_widths.get(col_idx, 12))
-        # Apply maximum cap
         cap = max_widths.get(col_idx, 50)
         adjusted = min(adjusted, cap)
 
         ws.column_dimensions[col_letter].width = adjusted
 
 
-def export_to_excel(docs: list[QuoteDocument], output_path: str):
-    """Write all extracted quotes into a single Excel workbook.
+def _build_line_item_rows(ws, doc: QuoteDocument, current_row: int, max_col: int) -> tuple[int, Optional[float]]:
+    """Write line items for a quote and return (next_row, total_net).
 
-    Each quote gets its own block: title (shaded) → header → line items.
-    Rows with flags in additional_info are highlighted yellow.
-    Price columns store actual numbers with $ format for filtering/summing.
-
-    Args:
-        docs: List of QuoteDocument objects from extraction + validation.
-        output_path: Path for the .xlsx output file.
+    Returns the total ext_net_price for use in summary rows.
     """
-    wb = openpyxl.Workbook()
+    # Title row
+    current_row = _write_title_row(ws, current_row, doc, max_col)
+    # Header row
+    current_row = _write_header_row(ws, current_row)
+
+    total_net = 0.0
+    if not doc.line_items:
+        cell = ws.cell(row=current_row, column=1, value="No line items extracted")
+        cell.alignment = Alignment(horizontal="center")
+        ws.merge_cells(
+            start_row=current_row, start_column=1,
+            end_row=current_row, end_column=max_col,
+        )
+        current_row += 1
+    else:
+        for item in doc.line_items:
+            current_row = _write_line_item(ws, current_row, item)
+            if item.ext_net_price is not None:
+                total_net += item.ext_net_price
+
+    return current_row, total_net
+
+
+def _build_discount_as_line_item_sheet(wb, doc: QuoteDocument) -> str:
+    """Sheet A: raw line items including the standalone discount line item."""
+    ws = wb.create_sheet(title="Discount as Line Item")
+    max_col = len(HEADERS)
+    current_row, total_net = _build_line_item_rows(ws, doc, 1, max_col)
+
+    # Summary row
+    current_row = _write_summary_row(ws, current_row + 1, "Total (incl. discount)", total_net, max_col)
+
+    # Auto-width and freeze
+    _auto_width(ws, max_col, current_row - 1)
+    ws.freeze_panes = "A2"
+
+    return ws.title
+
+
+def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
+    """Sheet B: discount proportionally allocated across priced line items.
+
+    Rules:
+    1. Exclude the discount line item entirely.
+    2. Exclude any line item with null/blank pricing (e.g. unpriced Base).
+    3. Compute: x = total_discount_amount / list_total
+       where list_total = sum of ext_list_price across priced items.
+    4. For every remaining priced item: ext_net_price = ext_list_price * (1 - x).
+    """
+    # Separate line items: priced items vs discount line vs unpriced
+    priced_items: list[QuoteLineItem] = []
+    discount_items: list[QuoteLineItem] = []
+    unpriced_items: list[QuoteLineItem] = []
+
+    for item in doc.line_items:
+        # An item is the discount line if it has a negative ext_net_price
+        # or its description indicates discount
+        is_negative = item.ext_net_price is not None and item.ext_net_price < 0
+        is_discount_desc = item.description and "discount" in item.description.lower()
+        if is_negative and is_discount_desc:
+            discount_items.append(item)
+        elif item.ext_list_price is not None and item.ext_net_price is not None:
+            priced_items.append(item)
+        else:
+            unpriced_items.append(item)
+
+    # Calculate total discount amount (positive value)
+    total_discount = abs(sum(
+        item.ext_net_price for item in discount_items if item.ext_net_price is not None
+    )) if discount_items else 0.0
+
+    # Calculate list total across priced items only
+    list_total = sum(
+        item.ext_list_price for item in priced_items if item.ext_list_price is not None
+    ) if priced_items else 0.0
+
+    # Calculate proportional allocation ratio
+    x = total_discount / list_total if list_total > 0 else 0.0
+
+    # Create the sheet
+    ws = wb.create_sheet(title="Discount Applied Proportionally")
+    max_col = len(HEADERS)
+
+    # Title row
+    current_row = _write_title_row(ws, 1, doc, max_col)
+
+    # Annotation row explaining the calculation
+    note = (
+        f"Discount of ${total_discount:,.2f} allocated proportionally "
+        f"at {x:.4%} across {len(priced_items)} priced line item(s)."
+    )
+    ws.merge_cells(
+        start_row=current_row, start_column=1,
+        end_row=current_row, end_column=max_col,
+    )
+    note_cell = ws.cell(row=current_row, column=1, value=note)
+    note_cell.font = Font(italic=True, size=10, color="666666")
+    note_cell.fill = NOTE_FILL
+    note_cell.alignment = Alignment(horizontal="left", vertical="center")
+    current_row += 1
+
+    # Header row
+    current_row = _write_header_row(ws, current_row)
+
+    # List unpriced items first (shown for reference, no discount applied)
+    for item in unpriced_items:
+        current_row = _write_line_item(ws, current_row, item)
+        # Override ext_net_price cell to show N/A
+        ext_net_cell = ws.cell(row=current_row - 1, column=8)
+        ext_net_cell.value = None
+        ext_net_cell.number_format = '@'
+        ext_net_cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+
+    # Write priced items with proportionally adjusted ext_net_price
+    total_adjusted_net = 0.0
+    for item in priced_items:
+        adjusted_ext_net = round(item.ext_list_price * (1 - x), 2) if item.ext_list_price is not None else None
+        total_adjusted_net += adjusted_ext_net if adjusted_ext_net is not None else 0.0
+
+        # Create a copy-like row with adjusted ext_net_price
+        values = [
+            item.catalog_number,
+            item.description,
+            item.component.value if item.component else "",
+            item.quantity,
+            item.list_price,
+            item.net_price,
+            item.ext_list_price,
+            adjusted_ext_net,
+            item.discount or "",
+            item.additional_info or "",
+        ]
+
+        has_flags = bool(item.additional_info)
+
+        for col_idx, val in enumerate(values, start=1):
+            cell = ws.cell(row=current_row, column=col_idx, value=val)
+            cell.border = THIN_BORDER
+
+            if col_idx in (5, 6, 7, 8):
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+                if val is not None:
+                    cell.number_format = '$#,##0.00'
+            elif col_idx == 9 and val:
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+            elif col_idx == 10:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            else:
+                cell.alignment = Alignment(vertical="top")
+
+            if has_flags:
+                cell.fill = FLAG_FILL
+
+        current_row += 1
+
+    # Summary row
+    current_row = _write_summary_row(
+        ws, current_row + 1,
+        f"Total (after {x:.4%} proportional discount)",
+        round(total_adjusted_net, 2),
+        max_col,
+    )
+
+    _auto_width(ws, max_col, current_row - 1)
+    ws.freeze_panes = "A2"
+
+    return ws.title
+
+
+def _build_single_sheet(wb, docs: list[QuoteDocument]) -> str:
+    """Single-sheet export: all quotes in sequential blocks, unchanged behavior."""
     ws = wb.active
     ws.title = "Quote Line Items"
 
@@ -168,34 +384,68 @@ def export_to_excel(docs: list[QuoteDocument], output_path: str):
 
     for doc_idx, doc in enumerate(docs):
         if doc_idx > 0:
-            # Blank separator row between quotes
-            current_row += 1
+            current_row += 1  # blank separator
 
-        # Title row (merged across all columns, shaded background)
-        current_row = _write_title_row(ws, current_row, doc, max_col)
+        current_row, _ = _build_line_item_rows(ws, doc, current_row, max_col)
 
-        # Header row
-        current_row = _write_header_row(ws, current_row)
-
-        # Line items
-        if not doc.line_items:
-            cell = ws.cell(row=current_row, column=1, value="No line items extracted")
-            cell.alignment = Alignment(horizontal="center")
-            ws.merge_cells(
-                start_row=current_row,
-                start_column=1,
-                end_row=current_row,
-                end_column=max_col,
-            )
-            current_row += 1
-        else:
-            for item in doc.line_items:
-                current_row = _write_line_item(ws, current_row, item)
-
-    # Auto-adjust column widths
     _auto_width(ws, max_col, current_row - 1)
-
-    # Freeze below the first quote's header
     ws.freeze_panes = "A2"
+
+    return ws.title
+
+
+def export_to_excel(docs: list[QuoteDocument], output_path: str):
+    """Write all extracted quotes into an Excel workbook.
+
+    Standard behavior (no discount line items):
+      Single sheet with all quotes in sequential blocks.
+
+    With discount line items (any quote has has_discount_line_item=True):
+      Two sheets per affected quote:
+        Sheet A - "Discount as Line Item": raw data including the discount.
+        Sheet B - "Discount Applied Proportionally": discount spread across
+          priced items proportionally by list price.
+
+    Quotes without discount line items remain single-sheet and are handled
+    identically to the previous behavior.
+
+    Args:
+        docs: List of QuoteDocument objects from extraction + validation.
+        output_path: Path for the .xlsx output file.
+    """
+    wb = openpyxl.Workbook()
+
+    # Check if any quote has a discount line item
+    has_any_discount = any(doc.has_discount_line_item for doc in docs)
+
+    if not has_any_discount:
+        # Standard single-sheet export — unchanged from previous behavior
+        _build_single_sheet(wb, docs)
+    else:
+        # Remove the default empty sheet — we'll create named ones
+        default_ws = wb.active
+        assert default_ws is not None  # Workbook always has an active sheet
+
+        # Track which sheets we create
+        sheets_created = []
+
+        for doc in docs:
+            if doc.has_discount_line_item:
+                # Create dual sheets for this quote
+                sheet_a = _build_discount_as_line_item_sheet(wb, doc)
+                sheet_b = _build_proportional_allocation_sheet(wb, doc)
+                sheets_created.extend([sheet_a, sheet_b])
+            else:
+                # Standard single-sheet block for this quote
+                ws = wb.create_sheet(title=f"{doc.source_id[:20]}")
+                max_col = len(HEADERS)
+                _build_line_item_rows(ws, doc, 1, max_col)
+                _auto_width(ws, max_col, ws.max_row)
+                ws.freeze_panes = "A2"
+                sheets_created.append(ws.title)
+
+        # Remove the default empty sheet if we created named ones
+        if sheets_created:
+            wb.remove(default_ws)
 
     wb.save(output_path)
