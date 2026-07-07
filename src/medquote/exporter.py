@@ -31,30 +31,8 @@ HEADERS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Color tier definitions
+# Style constants
 # ---------------------------------------------------------------------------
-# Each column is tagged with its data tier:
-#   "green"  = taken verbatim from the quote document (rendered as white bg)
-#   "yellow" = interpreted/derived from context in the quote
-#   "red"    = N/A — any blank/null cell gets red fill
-#
-# The tier name determines the label shown on the section header row, and
-# controls blank-cell fill colour.
-# ---------------------------------------------------------------------------
-COLUMN_TIERS = {
-    1: "green",   # Catalog #
-    2: "green",   # Description
-    3: "yellow",  # Component (AI-classified)
-    4: "green",   # QTY
-    5: "green",   # List Price
-    6: "green",   # Net Price
-    7: "yellow",  # Ext. List Price (computed)
-    8: "yellow",  # Ext. Net Price (computed)
-    9: "yellow",  # Discount (derived)
-   10: "yellow",  # Additional Information (AI flags)
-}
-
-# Style constants — no more yellow/orange fills on data rows
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
 TITLE_FONT = Font(bold=True, size=12, color="1F4E79")
@@ -68,53 +46,9 @@ THIN_BORDER = Border(
     bottom=Side(style="thin"),
 )
 
-# Colour fills for data-tier indicators
-GREEN_ACCENT = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+# Column-tier colours
 YELLOW_ACCENT = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-RED_ACCENT = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-
-# Fill for blank/N/A cells
 RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-
-
-def _write_section_header(ws, row: int, doc: QuoteDocument, max_col: int) -> int:
-    """Write a coloured data-tier label above the quote title.
-
-    A single row with three coloured bands indicating which columns are
-    green-tier (verbatim), yellow-tier (derived), and red-tier (N/A).
-    """
-    # Tier label: coloured bars above the quote
-    tier_labels = {"green": "  Sourced  ", "yellow": " Derived ", "red": "   N/A   "}
-    tier_colors = {"green": GREEN_ACCENT, "yellow": YELLOW_ACCENT, "red": RED_ACCENT}
-
-    # Group contiguous columns by tier for merged label spans
-    current_tier = None
-    start_col = 1
-    for col_idx in range(1, max_col + 1):
-        col_tier = COLUMN_TIERS.get(col_idx, "red")
-        if col_tier != current_tier:
-            if current_tier is not None and start_col <= col_idx - 1:
-                # Write the tier label
-                label_cell = ws.cell(row=row, column=start_col, value=tier_labels[current_tier])
-                label_cell.fill = tier_colors[current_tier]
-                label_cell.font = Font(bold=True, size=9, color="555555")
-                label_cell.alignment = Alignment(horizontal="center", vertical="center")
-                label_cell.border = THIN_BORDER
-                if col_idx - 1 > start_col:
-                    ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=col_idx - 1)
-            start_col = col_idx
-            current_tier = col_tier
-    # Write the last group
-    if current_tier is not None:
-        label_cell = ws.cell(row=row, column=start_col, value=tier_labels[current_tier])
-        label_cell.fill = tier_colors[current_tier]
-        label_cell.font = Font(bold=True, size=9, color="555555")
-        label_cell.alignment = Alignment(horizontal="center", vertical="center")
-        label_cell.border = THIN_BORDER
-        if max_col > start_col:
-            ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=max_col)
-
-    return row + 1
 
 
 def _write_title_row(ws, row: int, doc: QuoteDocument, max_col: int) -> int:
@@ -138,9 +72,9 @@ def _write_header_row(ws, row: int) -> int:
     return row + 1
 
 
-def _get_column_tier(col_idx: int) -> str:
-    """Return the data tier for a column index: 'green', 'yellow', or 'red'."""
-    return COLUMN_TIERS.get(col_idx, "red")
+def _is_derived_col(col_idx: int) -> bool:
+    """Return True if this column is a derived/interpreted value (gets yellow fill)."""
+    return col_idx in (3, 7, 8, 9, 10)
 
 
 def _write_line_item(
@@ -150,10 +84,10 @@ def _write_line_item(
     *,
     highlight_discount: bool = False,
 ) -> int:
-    """Write a single line item row with colour-coded cells.
+    """Write a single line item row.
 
-    Green-tier cells (sourced verbatim): white background.
-    Yellow-tier cells (derived/interpreted): yellow fill.
+    Green-tier cells (sourced verbatim): white background (no fill).
+    Yellow-tier cells (derived/interpreted): pale yellow fill.
     Any blank/null cell: red fill (N/A).
     """
     list_price = item.list_price if item.list_price is not None else None
@@ -177,19 +111,18 @@ def _write_line_item(
     for col_idx, val in enumerate(values, start=1):
         cell = ws.cell(row=row, column=col_idx, value=val)
         cell.border = THIN_BORDER
-        tier = _get_column_tier(col_idx)
 
-        # Apply colour based on tier and whether the cell is empty
+        # Apply colour based on whether the cell is empty or derived
         if val is None or (isinstance(val, str) and not val.strip()):
             # N/A → red fill
             cell.fill = RED_FILL
             # Keep the cell empty — don't write "N/A" text
             cell.value = None
-        elif tier == "yellow":
-            # Derived/interpreted value → yellow fill (with text in black)
+        elif _is_derived_col(col_idx):
+            # Derived/interpreted value → yellow fill
             cell.fill = YELLOW_ACCENT
         else:
-            # Green-tier (sourced verbatim) → white background (no fill)
+            # Sourced verbatim → white background (no fill)
             pass
 
         # Price columns: right-align, dollar format, actual numbers
@@ -276,8 +209,6 @@ def _build_line_item_rows(ws, doc: QuoteDocument, current_row: int, max_col: int
 
     Returns the total ext_net_price for use in summary rows.
     """
-    # Data-tier section header row (coloured bands)
-    current_row = _write_section_header(ws, current_row, doc, max_col)
     # Title row
     current_row = _write_title_row(ws, current_row, doc, max_col)
     # Header row
@@ -366,10 +297,8 @@ def _build_proportional_allocation_sheet(wb, doc: QuoteDocument) -> str:
     ws = wb.create_sheet(title="Discount Applied Proportionally")
     max_col = len(HEADERS)
 
-    # Data-tier section header
-    current_row = _write_section_header(ws, 1, doc, max_col)
     # Title row
-    current_row = _write_title_row(ws, current_row, doc, max_col)
+    current_row = _write_title_row(ws, 1, doc, max_col)
 
     # Annotation row explaining the calculation — no fill, just italic text
     note = (
