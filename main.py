@@ -1,7 +1,7 @@
 import os
 import glob
 from medquote.ingestion import extract_text
-from medquote.extraction import extract_fields
+from medquote.extraction import extract_quote
 
 SAMPLE_DIR = "sample_quotes"
 
@@ -20,7 +20,7 @@ def main():
                   "Skipping LLM call -- this document would default to 'needs review' in Phase 3.")
             continue
 
-        result = extract_fields(text)
+        result = extract_quote(text)
         print(result.model_dump())
 
 
