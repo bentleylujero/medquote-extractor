@@ -26,8 +26,22 @@ python process_quotes.py
 ## Pipeline
 
 ```
-PDF -> text extraction (pdfplumber + OCR fallback) -> AI extraction (GPT-4o structured output) -> validation -> Excel export
+PDF -> text extraction (pdfplumber + OCR fallback) -> **local redaction (Presidio)** -> AI extraction (GPT-4o structured output) -> validation -> Excel export
 ```
+
+## Privacy: Local Redaction
+
+Before any quote text reaches OpenAI's API, customer-identifying information (hospital/facility names, contact names, emails, phone numbers) is stripped out locally using **Microsoft Presidio** — an open-source tool that runs entirely on our own server. No redaction step contacts any external service.
+
+This is **ON by default**. Use `--skip-redaction` only for testing with non-sensitive sample data.
+
+The redaction module:
+- Runs between PDF text extraction and the AI extraction step
+- Uses spaCy `en_core_web_lg` for entity recognition (organizations, people, locations, emails, phone numbers)
+- Post-processes known false positives in medical-domain text (QML product codes, numeric quote IDs, "Bill To" headers)
+- Accepts a `known_facility_names` parameter to force-redact facility names Presidio's model might miss
+- Applies `<PERSON>`, `<EMAIL_ADDRESS>`, `<PHONE_NUMBER>`, `<LOCATION>` placeholders from Presidio's default anonymizer
+- Uses `[REDACTED FACILITY]` for facility names provided via the `known_facility_names` parameter
 
 ## Architecture
 
@@ -35,6 +49,7 @@ PDF -> text extraction (pdfplumber + OCR fallback) -> AI extraction (GPT-4o stru
 |--------|---------|
 | `process_quotes.py` | Entry point: orchestrates the full pipeline |
 | `src/medquote/ingestion.py` | Text extraction from PDFs (pdfplumber + Google OCR fallback) |
+| `src/medquote/redaction.py` | **Local PII redaction** via Microsoft Presidio (customer info stripped before AI call) |
 | `src/medquote/ocr.py` | Google Cloud Document AI OCR for scanned documents |
 | `src/medquote/extraction.py` | Schema-forced GPT-4o structured output |
 | `src/medquote/models.py` | Pydantic schemas (QuoteDocument, QuoteLineItem) |
