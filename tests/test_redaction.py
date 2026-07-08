@@ -151,6 +151,52 @@ def test_hospital_near_ship_to_is_redacted():
     )
 
 
+def test_catalog_numbers_preserved():
+    """All digit-dash catalog numbers must survive redaction, even if
+    Presidio would normally tag them as PHONE_NUMBER."""
+    text = (
+        "Catalog items:\n"
+        "2063832-001 AISYS CS2 PC SERVICE\n"
+        "1407-7013-000 ASSY-MSN, TOOL LEAK TEST\n"
+        "1011-8004-000 CASSETTE TEST VAPORIZER\n"
+        "1503-3236-000 COUPLING INLINE\n"
+        "1503-3119-000 COUPLING BODY IN-LINE\n"
+        "800-345-2700 should be real phone"
+    )
+    result = redact_customer_info(text)
+    for cat_num in [
+        "2063832-001", "1407-7013-000", "1011-8004-000",
+        "1503-3236-000", "1503-3119-000",
+    ]:
+        assert cat_num in result, (
+            f"Catalog number {cat_num} was destroyed by redaction! "
+            f"Result excerpt: ...{result[result.find(cat_num[:3]):result.find(cat_num[:3])+30] if cat_num[:3] in result else 'NOT FOUND'}..."
+        )
+    # Real phone number should still be redacted
+    assert "800-345-2700" not in result, (
+        f"Real phone number survived redaction! Result:\n{result}"
+    )
+
+
+def test_authority_facility_redacted():
+    """KERN COUNTY HOSPITAL AUTHORITY uses 'AUTHORITY' suffix, not
+    'Hospital' or 'Medical Center'. Should still be redacted."""
+    text = "Bill To:\nKERN COUNTY HOSPITAL AUTHORITY\n1700 MT VERNON AVE"
+    result = redact_customer_info(text)
+    assert "KERN COUNTY HOSPITAL AUTHORITY" not in result, (
+        f"AUTHORITY-suffix facility was NOT redacted! Result:\n{result}"
+    )
+
+
+def test_ship_to_next_line_redacted():
+    """Ship To label on its own line, facility name on the next line."""
+    text = "Ship To:\nKERN COUNTY HOSPITAL AUTHORITY\n1700 MT VERNON AVE"
+    result = redact_customer_info(text)
+    assert "KERN COUNTY HOSPITAL AUTHORITY" not in result, (
+        f"Next-line Ship To facility was NOT redacted! Result:\n{result}"
+    )
+
+
 def main():
     print("=" * 70)
     print("  Presidio Redaction Test Suite — Context-Window Edition")
@@ -243,6 +289,21 @@ def main():
 
     test_hospital_near_ship_to_is_redacted()
     print("  ✅ test_hospital_near_ship_to_is_redacted")
+
+    # --- New tests for catalog number protection & KERN COUNTY ---
+
+    print(f"\n{'='*70}")
+    print("  Catalog Number & Facility Name Tests")
+    print(f"{'='*70}")
+
+    test_catalog_numbers_preserved()
+    print("  ✅ test_catalog_numbers_preserved")
+
+    test_authority_facility_redacted()
+    print("  ✅ test_authority_facility_redacted")
+
+    test_ship_to_next_line_redacted()
+    print("  ✅ test_ship_to_next_line_redacted")
 
     print(f"\n{'='*70}")
     if all_ok:
