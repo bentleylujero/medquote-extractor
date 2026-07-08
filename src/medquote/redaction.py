@@ -235,14 +235,40 @@ def _redact_facility_names_fallback(text: str) -> str:
         )
 
     # Phase 2: handle label-only lines (e.g., "Bill To:" alone on a line)
+    # and lines ending with [REDACTED FACILITY]: (from Ship To: Bill To:
+    # being caught by pattern 1, leaving a trailing colon).
     lines = output.split("\n")
     for i, line in enumerate(lines):
-        if _NEXT_LINE_LABELS.search(line):
+        is_label = _NEXT_LINE_LABELS.search(line)
+        is_broken_marker = line.strip().endswith(f"{_FACILITY_REDACTED_PLACEHOLDER}:")
+        if is_label or is_broken_marker:
+            # Clean up trailing colon on broken markers
+            if is_broken_marker:
+                lines[i] = _FACILITY_REDACTED_PLACEHOLDER
             # Redact the next non-empty line
             for j in range(i + 1, min(i + 4, len(lines))):
                 if lines[j].strip():
                     lines[j] = _FACILITY_REDACTED_PLACEHOLDER
                     break
+
+    # Phase 3: redact the address line that follows a [REDACTED FACILITY] line.
+    # Address lines like "1700 MT VERNON AVE BAKERSFIELD CA 93306" contain the
+    # hospital's physical street address. Presidio usually catches the city but
+    # misses street names, state, and ZIP codes.
+    for i, line in enumerate(lines):
+        prev = lines[i - 1].strip() if i > 0 else ""
+        if (
+            line.strip()
+            and prev == _FACILITY_REDACTED_PLACEHOLDER
+            and line.strip() != _FACILITY_REDACTED_PLACEHOLDER
+            and not line.lstrip().startswith("<")  # already a Presidio token
+            and not line.startswith("[R")  # already a redacted token
+        ):
+            # Check it looks like an address (starts with a number or a city name)
+            if re.match(r"^\d+[\s,]", line) or re.search(
+                r"\b(?:CA|AZ|NY|TX|FL|IL|OH|PA|MN|WI|MI|IN|GA|NC|WA|CO|OR|UT|NV|MD|MA|CT|NJ|VA|LA|AL|KY|SC|OK|TN|MO|KS|NE|IA|AR|MS|ND|SD|DE|VT|NH|ME|RI|MT|WY|ID|AK|HI|NM|WV)\b.*\d{5}", line
+            ):
+                lines[i] = _FACILITY_REDACTED_PLACEHOLDER
 
     return "\n".join(lines)
 
