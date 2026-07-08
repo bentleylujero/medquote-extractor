@@ -6,6 +6,8 @@ phone numbers, and vendor/catalog/pricing data through the redaction
 module, then verifies:
   - Customer-identifying fields are redacted (not present in output)
   - Vendor names, dollar amounts, and catalog numbers are UNCHANGED
+  - ORGANIZATION matches are only redacted near customer-context keywords
+    (Bill To, Ship To, Attn, Hospital, etc.) — not everywhere
 """
 
 import sys
@@ -65,6 +67,20 @@ Description: G7 Acetabular Shell System
 Each: $3,450.00
 """
 
+# --- New test texts for context-window behavior ---
+
+CONTEXT_VENDOR_TEXT = "GE Healthcare Quote #12345\nItem: 45-982-1-V2, $149,500.00"
+
+CONTEXT_NEW_MFR_TEXT = (
+    "Acme Surgical Devices Corp Quote #99887\nItem: X-100, $5,000.00"
+)
+
+CONTEXT_BILL_TO_TEXT = "Bill To: St. Jude's Medical Center, 123 Main St"
+
+CONTEXT_SHIP_TO_TEXT = (
+    "Ship To: Mercy Hospital Northwest, Attn: Receiving Dept"
+)
+
 
 def check_redacted(label, text, expected_preserved, expected_removed):
     """Run redaction and check preservation/removal."""
@@ -72,11 +88,7 @@ def check_redacted(label, text, expected_preserved, expected_removed):
     print(f"  {label}")
     print(f"{'='*70}")
 
-    result = redact_customer_info(text, known_facility_names=[
-        "St. Jude's Medical Center",
-        "Mercy Hospital Northwest",
-        "Lakeside Regional Medical Center",
-    ])
+    result = redact_customer_info(text)
 
     print("\n  --- BEFORE (excerpt) ---")
     print(f"  {text.strip()}")
@@ -105,19 +117,52 @@ def check_redacted(label, text, expected_preserved, expected_removed):
     return preserved_ok, removed_ok
 
 
+def test_vendor_name_survives_when_not_near_customer_context():
+    text = "GE Healthcare Quote #12345\nItem: 45-982-1-V2, $149,500.00"
+    result = redact_customer_info(text)
+    assert "GE Healthcare" in result, (
+        f"GE Healthcare was redacted! Result:\n{result}"
+    )
+
+
+def test_new_unlisted_manufacturer_survives():
+    """A manufacturer never seen before should NOT be redacted, proving
+    we don't rely on a hardcoded list."""
+    text = "Acme Surgical Devices Corp Quote #99887\nItem: X-100, $5,000.00"
+    result = redact_customer_info(text)
+    assert "Acme Surgical Devices Corp" in result, (
+        f"Unknown manufacturer was redacted! Result:\n{result}"
+    )
+
+
+def test_hospital_near_bill_to_is_redacted():
+    text = "Bill To: St. Jude's Medical Center, 123 Main St"
+    result = redact_customer_info(text)
+    assert "St. Jude's" not in result, (
+        f"Hospital near Bill To was NOT redacted! Result:\n{result}"
+    )
+
+
+def test_hospital_near_ship_to_is_redacted():
+    text = "Ship To: Mercy Hospital Northwest, Attn: Receiving Dept"
+    result = redact_customer_info(text)
+    assert "Mercy Hospital Northwest" not in result, (
+        f"Hospital near Ship To was NOT redacted! Result:\n{result}"
+    )
+
+
 def main():
     print("=" * 70)
-    print("  Presidio Redaction Test Suite")
-    print("  Verifying customer info is stripped, vendor data is preserved")
+    print("  Presidio Redaction Test Suite — Context-Window Edition")
+    print("  Verifying: PII stripped, vendor preserved, context rule works")
     print("=" * 70)
 
     all_ok = True
 
+    # --- Original 3 samples ---
+
     # Sample A: Full quote header with customer details
-    # NOTE: Street addresses (like "3400 Health Parkway") are a known
-    # limitation — Presidio's LOCATION entity handles city/state better
-    # than standalone street addresses. Known facility names via
-    # the known_facility_names parameter handle the facility name itself.
+    # "FACILITY:" is a customer-context keyword -> hospital name redacted
     p_ok, r_ok = check_redacted(
         "Sample A — Full Quote Header",
         SAMPLE_A,
@@ -139,6 +184,7 @@ def main():
     all_ok = all_ok and p_ok and r_ok
 
     # Sample B: Short contact + vendor
+    # "Attn:" and "Hospital" are customer-context keywords
     p_ok, r_ok = check_redacted(
         "Sample B — Contact Block + Vendor",
         SAMPLE_B,
@@ -159,6 +205,7 @@ def main():
     all_ok = all_ok and p_ok and r_ok
 
     # Sample C: Name, facility, address + pricing
+    # "Ship To:" + "Medical Center" are customer-context keywords
     p_ok, r_ok = check_redacted(
         "Sample C — Full Contact + Medical Device Catalog",
         SAMPLE_C,
@@ -178,6 +225,24 @@ def main():
         ],
     )
     all_ok = all_ok and p_ok and r_ok
+
+    # --- New context-window tests ---
+
+    print(f"\n{'='*70}")
+    print("  Context-Window Rule Tests")
+    print(f"{'='*70}")
+
+    test_vendor_name_survives_when_not_near_customer_context()
+    print("  ✅ test_vendor_name_survives_when_not_near_customer_context")
+
+    test_new_unlisted_manufacturer_survives()
+    print("  ✅ test_new_unlisted_manufacturer_survives")
+
+    test_hospital_near_bill_to_is_redacted()
+    print("  ✅ test_hospital_near_bill_to_is_redacted")
+
+    test_hospital_near_ship_to_is_redacted()
+    print("  ✅ test_hospital_near_ship_to_is_redacted")
 
     print(f"\n{'='*70}")
     if all_ok:
