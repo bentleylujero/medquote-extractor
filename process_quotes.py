@@ -20,6 +20,7 @@ import sys
 import glob
 import argparse
 from medquote.ingestion import extract_text
+from medquote.redaction import redact_customer_info
 from medquote.extraction import extract_quote
 from medquote.validator import validate_quote
 from medquote.exporter import export_to_excel
@@ -43,6 +44,11 @@ def main():
         "--skip-ocr",
         action="store_true",
         help="Skip scanned PDFs instead of attempting OCR",
+    )
+    parser.add_argument(
+        "--skip-redaction",
+        action="store_true",
+        help="Skip local PII redaction before sending text to OpenAI (not recommended)",
     )
     args = parser.parse_args()
 
@@ -83,14 +89,19 @@ def main():
         print(f"  Text length: {len(text)} chars (first 200 shown below)")
         print(f"  {text[:200].strip()}...\n")
 
-        # Step 2: AI extraction
+        # Step 2: Redact customer info (local Presidio, no external call)
+        if not args.skip_redaction:
+            print("  Redacting customer info locally (Presidio)...")
+            text = redact_customer_info(text)
+
+        # Step 3: AI extraction
         print("  Calling AI for extraction...")
         try:
             doc = extract_quote(text)
             print(f"  ✓ Extracted: {doc.title}")
             print(f"    Raw line items: {len(doc.line_items)}")
 
-            # Step 2b: Validation / normalization
+            # Step 3b: Validation / normalization
             doc = validate_quote(doc, raw_text=text)
             print(f"  ✓ Validated: vendor normalized, prices computed, flags checked")
             print(f"    Final line items: {len(doc.line_items)}")
