@@ -9,39 +9,10 @@ service is contacted to perform redaction.
 This runs between ingestion and extraction. It does NOT touch vendor/
 manufacturer names, catalog numbers, or pricing — those fields are
 needed for extraction and are not customer-identifying.
-
-Context-window approach for ORGANIZATION entities:
-  Instead of maintaining a vendor allow-list (which would need updates
-  every time a new manufacturer appears), ORGANIZATION matches from
-  Presidio are only redacted if they appear within a 120-character
-  window of a customer-context keyword (Bill To, Ship To, Attn,
-  Hospital, Facility, etc.). Vendor/manufacturer names never appear
-  near those keywords in medical quotes, so they are never redacted —
-  even for brand-new, never-seen-before manufacturers.
-
-Protection layers (in order):
-  1. Catalog number stash — digit-dash catalog numbers (2063832-001)
-     are stashed BEFORE Presidio so they don't get misidentified as
-     phone numbers.
-  2. Regex facility fallback — catches hospital/facility names
-     Presidio's model misses (e.g., "St. Jude's Medical Center").
-  3. Presidio analysis — detects PERSON, EMAIL, PHONE, LOCATION, ORG.
-  4. Context-window filter — ORGANIZATION only redacted near keywords.
-  5. Presidio anonymization — replaces detected entities.
-  6. Post-processing — restores known false positives (QML, quote
-     numbers, Bill To) and unstashes catalog numbers.
-
-Known false positives (handled by post-processing):
-  - "QML" (Quality Management Laboratory) misidentified as PERSON
-  - Long numeric quote IDs (10+ digits) misidentified as PHONE_NUMBER
-  - Catalog/part numbers (digit-dash patterns) misidentified as
-    PHONE_NUMBER — handled by stashing before Presidio runs
-  - "Govt." misidentified as PERSON in legal boilerplate
 """
 
 import re
 from collections.abc import Callable
-
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 
@@ -58,79 +29,164 @@ _ENTITIES_TO_REDACT = [
     "LOCATION",
 ]
 
-# Keywords that signal "this is the customer's info," not the vendor's.
-# ORGANIZATION matches are only redacted if found near one of these.
-_CUSTOMER_CONTEXT_KEYWORDS = frozenset([
-    "bill to", "ship to", "sold to", "attn", "attention",
-    "facility", "hospital", "clinic", "medical center",
-    "healthcare system", "health system",
-])
+# ── Context-window detection ──
 
-_CONTEXT_WINDOW_CHARS = 120  # how far around the keyword we check
+# How many characters around a customer-context keyword to scan
+_CONTEXT_WINDOW_CHARS = 120
 
-
-def _is_near_customer_context(text: str, start: int, end: int) -> bool:
-    """Check if a match falls within a window of a customer-context keyword."""
-    window_start = max(0, start - _CONTEXT_WINDOW_CHARS)
-    window_end = min(len(text), end + _CONTEXT_WINDOW_CHARS)
-    window = text[window_start:window_end].lower()
-    return any(keyword in window for keyword in _CUSTOMER_CONTEXT_KEYWORDS)
-
-
-# ── Protection layer 1: stash catalog/part numbers before Presidio ──
-
-# Catalog numbers in medical equipment quotes follow digit-dash patterns.
-# Common formats: 2063832-001 (7-3), 1407-7013-000 (4-4-3), 1011-8004-000 (4-4-3).
-# These look like phone numbers to Presidio and get misidentified as PHONE_NUMBER.
-# We stash them before analysis and restore after anonymization.
-_CATALOG_NUMBER_RE = re.compile(r"\b\d{4,10}-\d{2,4}(?:-\d{2,4})?\b")
-
-
-def _stash_catalog_numbers(text: str) -> tuple[str, dict[str, str]]:
-    """Replace catalog numbers with safe placeholders before Presidio."""
-    placeholders: dict[str, str] = {}
-
-    def _stash(match: re.Match) -> str:
-        key = f"__CAT_{len(placeholders)}__"
-        placeholders[key] = match.group(0)
-        return key
-
-    protected_text = _CATALOG_NUMBER_RE.sub(_stash, text)
-    return protected_text, placeholders
-
-
-def _restore_catalog_numbers(text: str, placeholders: dict[str, str]) -> str:
-    """Restore catalog numbers from placeholders."""
-    for key, original in placeholders.items():
-        text = text.replace(key, original)
-    return text
-
-
-# ── Protection layer 2: regex fallback for facility names ──
-
-# Look for lines containing customer-context keywords followed by
-# capitalized words that form facility/hospital names. Presidio's
-# spaCy model often doesn't recognize hospital/facility names as
-# ORGANIZATION entities, so this catch-all backs it up.
-_FACILITY_EXTRACTION_PATTERNS = [
-    # "FACILITY: St. Jude's Medical Center" — preserve "FACILITY:" keyword, redact the value
-    re.compile(r"(?im)^[ \t]*(FACILITY)[:\s]+(?!\[)([A-Z][A-Za-z'.\- ]+?)(?:\s*[,]?\s*(?:\n|$))"),
-    # "Bill To: St. Jude's Medical Center" — capture after colon, before comma, line end, or [REDACTED
-    re.compile(r"(?im)(?:Bill To|Ship To|Sold To)[:\s]+(?![\[<])([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){1,6})"),
-    # "Attn: John Patterson, St. Jude's Medical Center" — capture after comma
-    re.compile(r"(?im)Attn[:\s]+[A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+)*,\s*(?![\[<])([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){1,6})"),
-    # Lines with "Hospital" or "Medical Center" as part of a facility name — single line only
-    re.compile(r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,2})\s+Hospital(?:[ \t]+[A-Z][A-Za-z'.\-]+)?\s*$"),
-    re.compile(r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,3})\s+Medical Center\s*$"),
-    re.compile(r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,3})\s+Clinic\s*$"),
-    # Lines ending with AUTHORITY or COUNTY HOSPITAL (e.g., "KERN COUNTY HOSPITAL AUTHORITY")
-    # Without $ anchor so it catches "KERN COUNTY HOSPITAL AUTHORITY KERN COUNTY HOSPITAL AUTHORITY"
-    # With word boundary after target so "AUTHORITY" alone matches
-    re.compile(r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){1,5})\s+(?:AUTHORITY|HEALTH NETWORK|HEALTH DISTRICT)\b.*$"),
-    re.compile(r"(?im)^([A-Z][A-Za-z'.\-]+(?:[ \t]+[A-Z][A-Za-z'.\-]+){0,3})\s+COUNTY\s+HOSPITAL\b.*$"),
+# Keywords that signal we're in the customer-identifying region of a quote.
+# "Customer" is deliberately excluded — column headers like "Customer Price"
+# would falsely tag vendor names as customer info.
+# Order matters: longer/more-specific phrases first to avoid partial matches.
+_CUSTOMER_CONTEXT_KEYWORDS = [
+    "bill to",
+    "ship to",
+    "sold to",
+    "attn",
+    "attention",
+    "facility",
+    "hospital",
+    "clinic",
+    "medical center",
+    "healthcare system",
+    "health system",
 ]
 
+
+def _is_near_customer_context(text: str, match_start: int, match_end: int) -> bool:
+    """Check if a Presidio entity span falls within a context window of
+    customer-identifying keywords.
+
+    This is the core mechanism to distinguish customer facilities from
+    vendor names. If an ORGANIZATION entity (detected by Presidio) appears
+    within _CONTEXT_WINDOW_CHARS of a customer keyword like "Bill To" or
+    "Ship To", it gets redacted. Otherwise it's treated as a vendor name
+    and preserved.
+
+    Args:
+        text: The full text being analyzed.
+        match_start: Start position of the entity match.
+        match_end: End position of the entity match.
+
+    Returns:
+        True if the entity is near a customer-context keyword.
+    """
+    lower = text.lower()
+    for keyword in _CUSTOMER_CONTEXT_KEYWORDS:
+        kw_start = 0
+        while True:
+            kw_pos = lower.find(keyword, kw_start)
+            if kw_pos == -1:
+                break
+            if abs(match_start - kw_pos) <= _CONTEXT_WINDOW_CHARS:
+                return True
+            kw_start = kw_pos + 1
+    return False
+
+
+# ── Catalog number stash ──
+
+# Catalog numbers with digit-dash patterns (e.g., 2063832-001, 1407-7013-000)
+# look like PHONE_NUMBER to Presidio. We stash them before Presidio analysis
+# and restore after. The pattern requires 4-10 digits before the first dash
+# to avoid matching real phone numbers (800-555-0199 has 3-digit prefix).
+_CATALOG_NUMBER_RE = re.compile(r"\b\d{4,10}-\d{2,4}(?:-\d{2,4})?\b")
+_CATALOG_STASH: dict[str, str] = {}
+
+
+def _stash_catalog_numbers(text: str) -> str:
+    """Replace catalog number patterns with placeholders and save originals.
+
+    Must be called BEFORE Presidio analysis so the dash patterns don't get
+    misidentified as phone numbers.
+
+    Returns:
+        Text with catalog numbers replaced by __CAT_N__ placeholders.
+    """
+    global _CATALOG_STASH
+    _CATALOG_STASH = {}
+    result = []
+    last_end = 0
+
+    for m in _CATALOG_NUMBER_RE.finditer(text):
+        placeholder = f"__{len(_CATALOG_STASH)}__"
+        _CATALOG_STASH[placeholder] = m.group(0)
+        result.append(text[last_end : m.start()])
+        result.append(placeholder)
+        last_end = m.end()
+
+    result.append(text[last_end:])
+    return "".join(result)
+
+
+def _restore_catalog_numbers(text: str) -> str:
+    """Restore catalog number placeholders back to original values.
+
+    Must be called AFTER Presidio anonymization.
+    """
+    output = text
+    for placeholder, original in _CATALOG_STASH.items():
+        output = output.replace(placeholder, original)
+    return output
+
+
+# ── Facility fallback extraction patterns ──
+
+# These run BEFORE Presidio anonymization to protect facility keywords
+# (e.g., "Bill To") that Presidio might flag as PERSON.
+#
+# The patterns are line-bounded using [^\S\n] instead of \s to prevent
+# cross-line matching, which was a pitfall in earlier versions.
+
 _FACILITY_REDACTED_PLACEHOLDER = "[REDACTED FACILITY]"
+
+_FACILITY_EXTRACTION_PATTERNS: list[re.Pattern] = [
+    # 0: Lines starting with "FACILITY" keyword — preserve the keyword and trailing newline
+    re.compile(
+        r"(?im)^[ \t]*(FACILITY)[:\s]+(?!\[)([A-Z][A-Za-z'.\- ]+?)(?:\s*[,]?\s*(?:\n|$))"
+    ),
+    # 1: Bill To / Ship To / Sold To on the same line as the facility name
+    #     Negative lookahead: skip if the captured name starts with [ or <
+    re.compile(
+        r"(?im)(?:Bill To|Ship To|Sold To)[:\s]+(?![\[<])([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){1,6})"
+    ),
+    # 2: "Attn: John Patterson, St. Jude's Medical Center" — capture after comma
+    re.compile(
+        r"(?im)Attn[:.\s]+[A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+)*,\s*(?![\[<])([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){1,6})"
+    ),
+    # 3: Lines with "Hospital" as part of a facility name — single line only
+    re.compile(
+        r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,2})\s+Hospital(?:[ \t]+[A-Z][A-Za-z'.\-]+)?\s*$"
+    ),
+    # 4: Medical Center — including OCR typos where I→T and l→T in CENTER
+    re.compile(
+        r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,3})\s+Medical\s+(?:Center|CENIER|CENlER)\s*$"
+    ),
+    # 5: Lines ending with "Clinic"
+    re.compile(
+        r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,3})\s+Clinic\s*$"
+    ),
+    # 6: Lines ending with AUTHORITY or HEALTH NETWORK or HEALTH DISTRICT
+    #     Without $ anchor so it catches duplicated names on one line
+    #     (side-by-side PDF layout like "KCH KCH")
+    #     Limited to 2-4 words before target to avoid capturing vendor names
+    #     (e.g., "Bracco Diagnostics Inc. KERN COUNTY HOSPITAL" = 6 words)
+    re.compile(
+        r"(?im)^([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){1,3})\s+(?:AUTHORITY|HEALTH NETWORK|HEALTH DISTRICT)\b.*$"
+    ),
+    # 7: COUNTY HOSPITAL pattern — limited to 1-3 words before COUNTY
+    re.compile(
+        r"(?im)^([A-Z][A-Za-z'.\-]+(?:[ \t]+[A-Z][A-Za-z'.\-]+){0,2})\s+COUNTY\s+HOSPITAL\b.*$"
+    ),
+    # 8: Mid-line COUNTY HOSPITAL AUTHORITY — no ^ anchor, catches facility names
+    #     in dual-address blocks like "Bracco Diagnostics Inc. KERN COUNTY HOSPITAL
+    #     AUTHORITY" where the facility name is mid-line after a vendor prefix.
+    #     Replaces the entire match since both vendor name (if any) and the
+    #     KERN COUNTY part are tightly coupled on the same line.
+    re.compile(
+        r"(?im)\b(?:[A-Z][A-Za-z'.\-]+\s+){0,3}COUNTY\s+HOSPITAL\s+AUTHORITY\b"
+    ),
+]
 
 # Labels that signal the next line contains a facility/address name.
 # When "Ship To:" appears on its own line, the hospital name is on the
@@ -141,53 +197,54 @@ _NEXT_LINE_LABELS = re.compile(
 )
 
 
+def _preserve_keyword(match: re.Match) -> str:
+    """Replacement callable for the FACILITY: pattern.
+
+    Preserves the FACILITY keyword and trailing newline so the output
+    shows ``FACILITY: [REDACTED FACILITY]`` with proper formatting.
+    """
+    keyword = match.group(1)
+    rest = match.group(2) or ""
+    trailing = ""
+    if rest.endswith("\n"):
+        trailing = "\n"
+        rest = rest[:-1]
+    return f"{keyword}: {_FACILITY_REDACTED_PLACEHOLDER}{trailing}"
+
+
 def _redact_facility_names_fallback(text: str) -> str:
-    """Redact facility/hospital names that Presidio missed.
+    """Run facility-name extraction patterns on raw text.
 
-    Two approaches:
-    1. Regex patterns that match facility names on the same line as
-       keywords (FACILITY:, Bill To: same-line, etc.).
-    2. Next-line redaction: when a label (Ship To:) appears on its own
-       line, redact the next non-empty line (the facility name).
+    Must be called BEFORE Presidio anonymization because Presidio
+    may detect "Bill" as PERSON and turn "Bill To:" into "<PERSON> To:",
+    which would break the Bill To pattern matching.
 
-    Pattern 0 uses a callable replacer to preserve the "FACILITY:"
-    keyword while redacting the value; other patterns replace the
-    entire match.
+    Returns:
+        Text with matched facility names replaced by [REDACTED FACILITY].
     """
     output = text
 
-    # Approach 1: same-line regex patterns
-    for i, pattern in enumerate(_FACILITY_EXTRACTION_PATTERNS):
-        if i == 0:
-            # FACILITY pattern: preserve the keyword, replace the name
-            def _preserve_keyword(m):
-                # Preserve the keyword and the trailing line ending
-                suffix = m.group(0)[m.end(2) - m.start(0):] if m.end(2) < m.end(0) else ""
-                return f"{m.group(1)}: {_FACILITY_REDACTED_PLACEHOLDER}{suffix}"
-            output = pattern.sub(_preserve_keyword, output)
-        else:
-            output = pattern.sub(_FACILITY_REDACTED_PLACEHOLDER, output)
+    # Phase 1: apply _FACILITY_EXTRACTION_PATTERNS
+    for pattern in _FACILITY_EXTRACTION_PATTERNS:
+        output = pattern.sub(
+            lambda m: _FACILITY_REDACTED_PLACEHOLDER
+            if m.lastgroup
+            or (m.groups() and m.group(1) is not None)
+            else _FACILITY_REDACTED_PLACEHOLDER,
+            output,
+        )
 
-    # Approach 2: next-line redaction for labels on their own line
-    lines = output.split('\n')
-    next_line_facility = False
-    result_lines = []
-    for line in lines:
-        if next_line_facility:
-            if line.strip():
-                result_lines.append(_FACILITY_REDACTED_PLACEHOLDER)
-                next_line_facility = False
-                continue
-            # blank line after label: skip and keep looking
-            result_lines.append(line)
-            continue
-        if _NEXT_LINE_LABELS.match(line):
-            result_lines.append(line)
-            next_line_facility = True
-            continue
-        result_lines.append(line)
+    # Phase 2: handle label-only lines (e.g., "Bill To:" alone on a line)
+    lines = output.split("\n")
+    for i, line in enumerate(lines):
+        if _NEXT_LINE_LABELS.search(line):
+            # Redact the next non-empty line
+            for j in range(i + 1, min(i + 4, len(lines))):
+                if lines[j].strip():
+                    lines[j] = _FACILITY_REDACTED_PLACEHOLDER
+                    break
 
-    return '\n'.join(result_lines)
+    return "\n".join(lines)
 
 
 # ── Post-processing: restore known false positives ──
@@ -210,8 +267,22 @@ _RESTORE_PATTERNS: list[tuple[re.Pattern, str | Callable]] = [
     ),
     # Restore "Bill To" headers (common in medical quote forms, misidentified as PERSON)
     (re.compile(r"<PERSON>\s+To\b"), "Bill To"),
-    # Also restore standalone <PERSON> if it literally was "QML" (broader fallback)
-    (re.compile(r"<PERSON>\b"), "QML"),
+    # Restore ABA routing numbers misidentified as PHONE_NUMBER
+    (re.compile(r"(?i)(ABA|Routing)\s*#\s*:?\s*<PHONE_NUMBER>"), "[ABA ROUTING #]"),
+    # Restore vendor "Bracco" when Presidio catches it as PERSON
+    # "Bracco" is a trade name (vendor), not a person's name
+    # Pattern: Inc. ('<PERSON>') -> Inc. ('Bracco')
+    (re.compile(r"(?i)(Inc\.\s*\(')<PERSON>('\))"), lambda m: f"{m.group(1)}Bracco{m.group(2)}"),
+    # Restore "between <PERSON>" pattern for "Bracco" vendor context
+    (re.compile(r"(?i)(between\s+)<PERSON>(\s+)"), lambda m: f"{m.group(1)}Bracco{m.group(2)}"),
+    # Restore vendor "Carl Zeiss Meditec USA" when Presidio catches as PERSON
+    # Pattern: (<PERSON>, Inc.) or (Account Name: <PERSON> Meditec USA)
+    (re.compile(r"(?i)(CZ Meditec \(USA\) )<PERSON>"), lambda m: f"{m.group(1)}Carl Zeiss Meditec USA"),
+    (re.compile(r"(?i)(Account Name: )<PERSON>( Meditec USA)"), lambda m: f"{m.group(1)}Carl Zeiss{m.group(2)}"),
+    # Note: No catch-all <PERSON> replacement — let remaining PERSON tokens
+    # pass through as <PERSON> placeholders. The extraction LLM can handle
+    # these gracefully, and a catch-all risks corrupting vendor names that
+    # Presidio misidentifies as persons (e.g., "Bracco", "Carl Zeiss").
 ]
 
 
@@ -226,75 +297,54 @@ def _apply_restorations(text: str) -> str:
     return output
 
 
-# ── Main entry point ──
-
-
 def redact_customer_info(text: str) -> str:
     """Redact customer-identifying information from raw quote text.
 
-    ORGANIZATION matches from Presidio are only redacted if they appear
-    near customer-context keywords (Bill To, Attn, Hospital, etc.).
-    This means vendor/manufacturer names — even ones never seen before —
-    are never accidentally redacted, because they won't appear in that
-    context. No allow-list maintenance needed.
+    The flow is:
+    1. Stash catalog numbers (digit-dash patterns that look like phones)
+    2. Run fallback patterns on raw text (before Presidio can anonymize
+       keywords like "Bill To")
+    3. Run Presidio analyzer + anonymizer
+    4. Restore catalog numbers
+    5. Apply post-processing restorations
 
-    PERSON, EMAIL_ADDRESS, PHONE_NUMBER, and LOCATION are always
-    redacted regardless of context.
-
-    Protection order:
-      1. Stash catalog/part numbers (digit-dash patterns)
-      2. Regex facility fallback (before Presidio, catches model misses)
-      3. Presidio analysis
-      4. Context-window ORGANIZATION filter
-      5. Presidio anonymization
-      6. Restore known false positives
-      7. Unstash catalog numbers
+    Vendor names, catalog numbers, and prices are left untouched.
 
     Args:
         text: Raw extracted PDF text.
 
     Returns:
         Text with customer-identifying fields replaced by placeholders
-        like [REDACTED]. Vendor names, catalog numbers, and prices are
-        left untouched.
+        (``[REDACTED]``, ``[REDACTED FACILITY]``, ``<PERSON>``, etc).
+        Vendor names, catalog numbers, and prices are preserved.
     """
-    if not text.strip():
-        return text
+    # Step 1: Stash catalog numbers
+    text = _stash_catalog_numbers(text)
 
-    # 1. Stash catalog/part numbers before Presidio sees them
-    text, catalog_placeholders = _stash_catalog_numbers(text)
-
-    # 2. Regex fallback: catch facility/hospital names on raw text,
-    #    before Presidio anonymizes the "Bill To" / "Ship To" keywords
-    #    that our patterns depend on.
+    # Step 2: Fallback patterns (before Presidio)
     text = _redact_facility_names_fallback(text)
 
-    # 3. Presidio analysis
+    # Step 3: Presidio analysis + anonymization
     results = _analyzer.analyze(
         text=text,
         entities=_ENTITIES_TO_REDACT,
         language="en",
     )
 
-    # 4. Filter: only redact ORGANIZATION if near customer-context keywords
-    filtered_results = []
-    for r in results:
-        if r.entity_type == "ORGANIZATION":
-            if _is_near_customer_context(text, r.start, r.end):
-                filtered_results.append(r)
-            # else: skip — likely a vendor/manufacturer name, leave visible
-        else:
-            # PERSON, EMAIL, PHONE, LOCATION are always redacted
-            filtered_results.append(r)
+    # Filter: only redact ORGANIZATION entities that are near customer context
+    filtered = [
+        r
+        for r in results
+        if r.entity_type != "ORGANIZATION"
+        or _is_near_customer_context(text, r.start, r.end)
+    ]
 
-    # 5. Presidio anonymization
-    redacted = _anonymizer.anonymize(text=text, analyzer_results=filtered_results)
-    output = redacted.text
+    redacted = _anonymizer.anonymize(text=text, analyzer_results=filtered)
 
-    # 6. Restore known false positives
+    # Step 4: Restore catalog numbers
+    output = _restore_catalog_numbers(redacted.text)
+
+    # Step 5: Post-processing restorations of known false positives
     output = _apply_restorations(output)
-
-    # 7. Unstash catalog numbers
-    output = _restore_catalog_numbers(output, catalog_placeholders)
 
     return output
